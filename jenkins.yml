@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Pluralsight Jenkins Stack
+# Parameters to be passed in when deploying the Cloudformation template
+Parameters:
+
+  SubnetId:
+    Description: The target Subnet Id
+    Type: AWS::EC2::Subnet::Id
+  VpcId:
+    Description: The target VPC Id
+    Type: AWS::EC2::VPC::Id
+  JenkinsDockerHubImageName:
+    Description: The name of the container on Docker Hub that has our Jenkins image
+    Type: String
+    Default: '4e82p7d6p872/jenkins:ecs'
+  KeyName:
+    Description: The key pair that is allowed SSH access
+    Type: String
+    Default: 'pluralsight'
+  AMIImageId:
+    Description: The AMI id to use for the ECS instance
+    Type: String
+    Default: 'ami-b677c9d2'
+    # The list of the latest images can be found here:
+    # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+  EC2InstanceType:
+    Description: The EC2 instance type to launch
+    Type: String
+    Default: 't2.micro'
+  # This values must match the container uid/gid for the Jenkins user. This makes
+  # sure it has access to the Jenkins home dir
+  JenkinsUID:
+    Description: The UID of the Jenkins user on the EC2 Host instance.
+    Type: String
+    Default: '1000'
+  JenkinsGID:
+    Description: The GID of the Jenkins user on the EC2 Host instance.
+    Type: String
+    Default: '1000'
+  PermittedCIDRRange:
+    Description: The CIDR range that Web and SSH access is permitted to the EC2 instance
+    Type: String
+    Default: '124.188.68.0/24'
+    
+Outputs:
+  EC2InstanceDomainName:
+    Description: Public DNS name of EC2 Instance
+    Value:
+      Fn::GetAtt:
+      - EC2Instance
+      - PublicDnsName
+  ElbDomainName:
+    Description: Public DNS name of Elastic Load Balancer
+    Value:
+      Fn::GetAtt:
+      - ElasticLoadBalancer
+      - DNSName
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      # The IAM role is used to allow communication to the ECS service
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      ImageId:
+        Ref: AMIImageId
+      InstanceType:
+        Ref: EC2InstanceType
+      KeyName:
+        Ref: KeyName
+      SubnetId:
+        Ref: SubnetId
+      SecurityGroupIds:
+      - Ref: EC2InstanceSecurityGroup
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::StackName
+            - '-instance'
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+          - ''
+          - - '#!/bin/bash
+
+              '
+            - 'echo ECS_CLUSTER='
+            - Ref: EcsCluster
+            - ' >> /etc/ecs/ecs.config; '
+            - 'groupadd -g '
+            - Ref: JenkinsGID
+            - ' jenkins; '
+            - 'useradd -u '
+            - Ref: JenkinsUID
+            - ' -g jenkins jenkins; '
+            - 'mkdir -p /ecs/jenkins_home; '
+            - 'chown -R jenkins:jenkins /ecs/jenkins_home; '
+
+  # This will attach an IAM Role to the EC2 instance
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - Ref: EC2InstanceRole
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      # This role allows the EC2 instance to join an ECS Cluster and
+      # run ECS Tasks and Services
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Path: /
+
+  EC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 
+        Fn::Join:
+        - ''
+        - - Ref: AWS::StackName
+          - ' EC2 Instance Ingress'
+      SecurityGroupIngress:
+      - FromPort: '8080'
+        IpProtocol: tcp
+        SourceSecurityGroupId:
+          Ref: ElbSecurityGroup
+        ToPort: '8080'
+      - CidrIp:
+          Ref: PermittedCIDRRange
+        FromPort: '22'
+        IpProtocol: tcp
+        ToPort: '22'
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::StackName
+            - '-instance-sg'
+      VpcId:
+        Ref: VpcId
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+ 
+  EcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Ref: EcsCluster
+      DesiredCount: 1
+      TaskDefinition:
+        Ref: EcsTaskDefinition
+
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+      - Image:
+          Ref: JenkinsDockerHubImageName
+        Memory: 900
+        MountPoints:
+        # SourceVolume matches up to the Volumes definition
+        - SourceVolume: jenkins_home
+          ContainerPath: /var/jenkins_home
+        - SourceVolume: docker
+          ContainerPath: /var/run/docker.sock
+        Name: jenkins
+        PortMappings:
+        - ContainerPort: 8080
+          HostPort: 8080
+      Volumes:
+      - Name: jenkins_home
+        Host:
+          SourcePath: /ecs/jenkins_home
+      - Name: docker
+        Host:
+          SourcePath: /var/run/docker.sock
+        
+
+  # Going to run the ELB in a single zone for simplicity
+  ElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      CrossZone: 'false'
+      Instances:
+      - Ref: EC2Instance
+      Listeners:
+      - InstancePort: '8080'
+        LoadBalancerPort: '80'
+        Protocol: http
+      SecurityGroups:
+      - Ref: ElbSecurityGroup
+      Subnets:
+      - Ref: SubnetId
+
+  ElbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 
+
+        Fn::Join:
+        - ''
+        - - Ref: AWS::StackName
+          - ' ELB Ingress Access'
+      SecurityGroupIngress:
+      - CidrIp:
+          Ref: PermittedCIDRRange
+        FromPort: '80'
+        IpProtocol: tcp
+        ToPort: '80'
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::StackName
+            - '-elb-sg'
+      VpcId:
+        Ref: VpcId

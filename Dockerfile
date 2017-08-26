@@ -41,6 +41,9 @@ RUN pip install docker-compose==${DOCKER_COMPOSE:-1.14.0} && \
 # Change to jenkins user
 USER jenkins
 
+# Create the environment variable to bypass Jenkins Setup Wizard
+ENV JAVA_OPTS -Djenkins.install.runSetupWizard=false
+
 # Add Jenkins plugins
 COPY plugins.txt /usr/share/jenkins/plugins.txt
 RUN /usr/local/bin/install-plugins.sh < /usr/share/jenkins/plugins.txt
